@@ -6,7 +6,7 @@
     name="viewport"
     content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
   />
-  <title>Universal Line Inspector</title>
+  <title>Universal Line Inspector — Object-Gated v6.1</title>
 
   <style>
     :root {
@@ -423,15 +423,21 @@
 
       <div class="slider-row">
         <label for="presenceThreshold">Object trigger</label>
-        <input id="presenceThreshold" type="range" min="1" max="45" value="3" />
-        <span id="presenceValue">3%</span>
+        <input id="presenceThreshold" type="range" min="1" max="45" value="5" />
+        <span id="presenceValue">5%</span>
       </div>
 
       <div class="slider-row">
         <label for="beltPixelThreshold">Belt subtraction</label>
-        <input id="beltPixelThreshold" type="range" min="20" max="110" value="58" />
-        <span id="beltPixelValue">58</span>
+        <input id="beltPixelThreshold" type="range" min="20" max="110" value="64" />
+        <span id="beltPixelValue">64</span>
       </div>
+
+      <p class="helper">
+        Object-gated mode: normal belt texture, belt movement, shadows and small
+        pattern changes are ignored. Only a trained product-like region or a large,
+        solid unknown object can reach the inspection stage.
+      </p>
 
       <div class="controls">
         <button class="secondary" id="recommendedSettingsBtn">
@@ -580,14 +586,30 @@
     });
 
     const PROCESS_SIZE = 320;
-    const REQUIRED_STABLE_FRAMES = 2;
-    const MIN_OBJECT_BOX_AREA = 0.025;
-    const MAX_OBJECT_BOX_AREA = 0.98;
-    const MIN_COMPONENT_PIXELS = 380;
-    const PROCESS_INTERVAL_MS = 85;
+    const PROCESS_INTERVAL_MS = 90;
+
+    // Product confirmation and tracking.
+    const REQUIRED_STABLE_FRAMES = 3;
     const TRACK_MAX_MISSED_FRAMES = 5;
-    const TRACK_MATCH_DISTANCE = 95;
-    const TRACK_MIN_AGE_TO_INSPECT = 2;
+    const TRACK_MATCH_DISTANCE = 90;
+    const TRACK_MIN_AGE_TO_INSPECT = 3;
+
+    // Minimum geometry required before any region can be treated as a product.
+    const MIN_OBJECT_BOX_AREA = 0.035;
+    const MAX_OBJECT_BOX_AREA = 0.68;
+    const MIN_COMPONENT_PIXELS = 620;
+
+    // Good-product and unknown-object gating.
+    const GOOD_CANDIDATE_MARGIN = 1.35;
+    const UNKNOWN_MIN_BOX_AREA = 0.065;
+    const UNKNOWN_MIN_FILL_RATIO = 0.16;
+    const UNKNOWN_MIN_DIMENSION_RATIO = 0.16;
+    const UNKNOWN_CONFIRM_FRAMES = 4;
+
+    // Ignore sudden changes affecting most of the camera scene.
+    // This prevents camera movement, lighting changes and background obstruction
+    // from creating a false reject.
+    const GLOBAL_CHANGE_SUPPRESSION = 0.58;
 
     const video = document.getElementById("webcam");
     const stage = document.getElementById("stage");
@@ -633,6 +655,7 @@
     let badSamples = [];
 
     let beltModel = null;
+    let beltVarianceModel = null;
     let tracks = new Map();
     let nextTrackId = 1;
     let lastProcessTime = 0;
@@ -959,11 +982,13 @@
     function buildBeltModel() {
       if (beltSamples.length === 0) {
         beltModel = null;
+        beltVarianceModel = null;
         return;
       }
 
       const pixelCount = PROCESS_SIZE * PROCESS_SIZE;
       const model = new Float32Array(pixelCount * 3);
+      const variance = new Float32Array(pixelCount * 3);
 
       for (const sample of beltSamples) {
         const data = sample.imageData.data;
@@ -984,14 +1009,37 @@
         model[i] /= divisor;
       }
 
+      // Learn normal belt texture and motion variation at every pixel.
+      for (const sample of beltSamples) {
+        const data = sample.imageData.data;
+
+        for (let p = 0; p < pixelCount; p++) {
+          const i = p * 4;
+          const m = p * 3;
+
+          const dr = data[i] - model[m];
+          const dg = data[i + 1] - model[m + 1];
+          const db = data[i + 2] - model[m + 2];
+
+          variance[m] += dr * dr;
+          variance[m + 1] += dg * dg;
+          variance[m + 2] += db * db;
+        }
+      }
+
+      for (let i = 0; i < variance.length; i++) {
+        variance[i] = Math.sqrt(variance[i] / divisor);
+      }
+
       beltModel = model;
+      beltVarianceModel = variance;
     }
 
     function createForegroundMask(imageData) {
       const pixelCount = imageData.width * imageData.height;
       const mask = new Uint8Array(pixelCount);
       const data = imageData.data;
-      const threshold = Number(beltPixelThreshold.value);
+      const baseThreshold = Number(beltPixelThreshold.value);
       let foregroundCount = 0;
 
       if (!beltModel) {
@@ -1008,7 +1056,19 @@
 
         const distance = Math.sqrt(dr * dr + dg * dg + db * db);
 
-        if (distance >= threshold) {
+        // Pixels that naturally vary on the moving belt receive a higher
+        // threshold. This suppresses belt texture, seams, glare and shadows.
+        const normalVariation = beltVarianceModel
+          ? Math.sqrt(
+              beltVarianceModel[m] * beltVarianceModel[m] +
+              beltVarianceModel[m + 1] * beltVarianceModel[m + 1] +
+              beltVarianceModel[m + 2] * beltVarianceModel[m + 2]
+            )
+          : 0;
+
+        const adaptiveThreshold = baseThreshold + Math.min(52, normalVariation * 2.4);
+
+        if (distance >= adaptiveThreshold) {
           mask[p] = 255;
           foregroundCount++;
         }
@@ -1151,9 +1211,9 @@
         const boxCoverage = boxArea / (width * height);
 
         const plausible =
-          aspectRatio >= 0.18 &&
-          aspectRatio <= 5.5 &&
-          fillRatio >= 0.06 &&
+          aspectRatio >= 0.28 &&
+          aspectRatio <= 4.2 &&
+          fillRatio >= 0.10 &&
           boxCoverage >= MIN_OBJECT_BOX_AREA &&
           boxCoverage <= MAX_OBJECT_BOX_AREA;
 
@@ -1229,6 +1289,7 @@
     function getProductCandidates(imageData, mask, width, height) {
       const components = findForegroundComponents(mask, width, height);
       const candidates = [];
+      const goodLimit = Number(differenceThreshold.value);
 
       for (const bounds of components) {
         if (!isCompleteObject(bounds, width, height)) continue;
@@ -1238,6 +1299,7 @@
           bounds,
           false
         );
+
         const feature = createFeatureVector(candidateImage);
         const nearestGood = Math.min(
           ...goodSamples.map((sample) =>
@@ -1247,14 +1309,33 @@
 
         const centreX = bounds.x + bounds.width / 2;
         const centreY = bounds.y + bounds.height / 2;
+        const minimumDimension =
+          Math.min(bounds.width / width, bounds.height / height);
+
+        // Known-product gate:
+        // Keep regions reasonably close to at least one trained good sample.
+        const resemblesProduct =
+          nearestGood <= goodLimit * GOOD_CANDIDATE_MARGIN;
+
+        // Unknown-object gate:
+        // A truly foreign object may not resemble a good sample, but it must
+        // still be large, solid and product-sized. Random belt patterns fail
+        // this gate and therefore can never sound the alarm.
+        const solidUnknownObject =
+          bounds.boxCoverage >= UNKNOWN_MIN_BOX_AREA &&
+          bounds.fillRatio >= UNKNOWN_MIN_FILL_RATIO &&
+          minimumDimension >= UNKNOWN_MIN_DIMENSION_RATIO;
+
+        if (!resemblesProduct && !solidUnknownObject) continue;
+
         const centreDistance = Math.hypot(
           centreX - width / 2,
           centreY - height / 2
         );
         const maxCentreDistance = Math.hypot(width / 2, height / 2);
-        const centrePenalty = (centreDistance / maxCentreDistance) * 8;
+        const centrePenalty = (centreDistance / maxCentreDistance) * 5;
         const shapePenalty =
-          Math.abs(0.55 - Math.min(1, bounds.fillRatio)) * 7;
+          Math.abs(0.58 - Math.min(1, bounds.fillRatio)) * 5;
 
         candidates.push({
           ...bounds,
@@ -1262,14 +1343,22 @@
           centreY,
           candidateImage,
           nearestGood,
+          resemblesProduct,
+          solidUnknownObject,
+          requiredConfirmationFrames: resemblesProduct
+            ? REQUIRED_STABLE_FRAMES
+            : UNKNOWN_CONFIRM_FRAMES,
           selectionScore: nearestGood + centrePenalty + shapePenalty
         });
       }
 
-      // Best product-like regions first. Keep several so two close products can
-      // be tracked in the same frame when a visible belt gap separates them.
       return candidates
-        .sort((a, b) => a.selectionScore - b.selectionScore)
+        .sort((a, b) => {
+          if (a.resemblesProduct !== b.resemblesProduct) {
+            return a.resemblesProduct ? -1 : 1;
+          }
+          return a.selectionScore - b.selectionScore;
+        })
         .slice(0, 6);
     }
 
@@ -1314,6 +1403,9 @@
         track.centreY = candidate.centreY;
         track.imageData = candidate.candidateImage;
         track.nearestGood = candidate.nearestGood;
+        track.resemblesProduct = candidate.resemblesProduct;
+        track.solidUnknownObject = candidate.solidUnknownObject;
+        track.requiredConfirmationFrames = candidate.requiredConfirmationFrames;
         track.age += 1;
         track.missedFrames = 0;
         track.stableFrames = stable ? track.stableFrames + 1 : 1;
@@ -1348,6 +1440,9 @@
           centreY: candidate.centreY,
           imageData: candidate.candidateImage,
           nearestGood: candidate.nearestGood,
+          resemblesProduct: candidate.resemblesProduct,
+          solidUnknownObject: candidate.solidUnknownObject,
+          requiredConfirmationFrames: candidate.requiredConfirmationFrames,
           age: 1,
           stableFrames: 1,
           missedFrames: 0,
@@ -1368,11 +1463,11 @@
         bounds.boxCoverage <= MAX_OBJECT_BOX_AREA;
 
       const dimensionsOK =
-        bounds.width >= width * 0.09 &&
-        bounds.height >= height * 0.09;
+        bounds.width >= width * 0.13 &&
+        bounds.height >= height * 0.13;
 
       const shapeOK =
-        bounds.fillRatio === undefined || bounds.fillRatio >= 0.08;
+        bounds.fillRatio === undefined || bounds.fillRatio >= 0.10;
 
       // Do not reject a valid package merely because its padded detection box
       // is close to one side of the wide ROI.
@@ -1539,7 +1634,7 @@
       saveCalibrationBtn.disabled = false;
 
       calibrationMessage.textContent =
-        `Calibration successful. Belt samples: ${beltSamples.length}, ` +
+        `Object-gated calibration successful. Belt samples: ${beltSamples.length}, ` +
         `good samples: ${goodSamples.length}, optional known rejects: ${badSamples.length}.`;
     }
 
@@ -1623,7 +1718,15 @@
       for (const track of trackList) {
         if (track.inspected || track.missedFrames > 0) continue;
         if (track.age < TRACK_MIN_AGE_TO_INSPECT) continue;
-        if (track.stableFrames < REQUIRED_STABLE_FRAMES) continue;
+
+        const requiredFrames =
+          track.requiredConfirmationFrames || REQUIRED_STABLE_FRAMES;
+
+        if (track.stableFrames < requiredFrames) continue;
+
+        // Final object gate. A track that is neither good-like nor a stable,
+        // solid unknown object is background noise and is silently ignored.
+        if (!track.resemblesProduct && !track.solidUnknownObject) continue;
 
         logRejectForTrack(track);
 
@@ -1645,7 +1748,14 @@
       const waiting = visible.filter((track) => !track.inspected);
 
       if (visible.length === 0) {
-        setStatus("BELT CLEAR — READY FOR NEXT PRODUCT", "status-empty");
+        if (foregroundCoverage > Number(presenceThreshold.value) / 100) {
+          setStatus(
+            "BELT/BACKGROUND MOVEMENT IGNORED — WAITING FOR A REAL PRODUCT",
+            "status-empty"
+          );
+        } else {
+          setStatus("BELT CLEAR OR STOPPED — READY FOR PRODUCT", "status-empty");
+        }
       } else if (rejects.length > 0) {
         setStatus(
           `REJECT RECORDED — ${visible.length} PRODUCT(S) TRACKED; WAITING FOR EACH TO EXIT`,
@@ -1686,13 +1796,30 @@
 
           let candidates = [];
 
-          if (foreground.coverage >= trigger) {
+          const wholeSceneChanged =
+            foreground.coverage >= GLOBAL_CHANGE_SUPPRESSION;
+
+          if (foreground.coverage >= trigger && !wholeSceneChanged) {
             candidates = getProductCandidates(
               roiData,
               foreground.mask,
               roiData.width,
               roiData.height
             );
+          }
+
+          // A sudden change across most of the ROI is normally camera movement,
+          // lighting change, obstruction or belt/background disturbance—not a
+          // single product. Clear provisional tracks and never alert on it.
+          if (wholeSceneChanged) {
+            tracks.clear();
+            clearDetectionOverlay();
+            setStatus(
+              "BACKGROUND/CAMERA CHANGE DETECTED — ALERTS PAUSED UNTIL SCENE STABILISES",
+              "status-entering"
+            );
+            animationFrameId = requestAnimationFrame(scanLoop);
+            return;
           }
 
           const trackList = updateProductTracks(candidates);
@@ -1812,9 +1939,9 @@
         differenceThreshold.value =
           saved.settings?.differenceThreshold ?? 24;
         presenceThreshold.value =
-          saved.settings?.presenceThreshold ?? 3;
+          saved.settings?.presenceThreshold ?? 5;
         beltPixelThreshold.value =
-          saved.settings?.beltPixelThreshold ?? 52;
+          saved.settings?.beltPixelThreshold ?? 64;
 
         updateSliderLabels();
         renderSampleStrips();
@@ -1951,8 +2078,8 @@
     if (recommendedSettingsBtn) {
       recommendedSettingsBtn.addEventListener("click", () => {
         differenceThreshold.value = 24;
-        presenceThreshold.value = 3;
-        beltPixelThreshold.value = 58;
+        presenceThreshold.value = 5;
+        beltPixelThreshold.value = 64;
         updateSliderLabels();
 
         calibrationMessage.textContent =
