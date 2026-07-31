@@ -482,6 +482,11 @@
           Capture or upload the empty belt from the same camera position. Multiple belt
           samples improve subtraction.
         </p>
+
+        <p class="helper">
+          Products are assigned separate tracking IDs. A visible belt gap can start the
+          next product before the previous product has fully left the camera view.
+        </p>
       </div>
 
       <div class="section">
@@ -510,7 +515,7 @@
 
       <div class="section">
         <div class="section-title bad">
-          Known Reject Bank (<span id="badCount">0</span>)
+          Known Reject Bank — Optional (<span id="badCount">0</span>)
         </div>
 
         <div id="badStrip" class="sample-strip"></div>
@@ -525,6 +530,11 @@
 
           <button class="secondary" id="clearBadBtn">Clear</button>
         </div>
+
+        <p class="helper">
+          Optional. The system already rejects anything outside the good-sample range.
+          Add bad samples only to identify familiar defects or wrong products more clearly.
+        </p>
       </div>
 
       <div class="section">
@@ -535,7 +545,12 @@
         </div>
 
         <p id="calibrationMessage" class="helper">
-          Add at least one empty-belt sample and one good sample.
+          Add empty-belt samples and accepted good-product samples. Reject samples are optional.
+        </p>
+
+        <p class="helper">
+          Decision rule: match to any accepted good sample = PASS. Anything outside the
+          good range = REJECT. Optional bad samples only improve the reject description.
         </p>
       </div>
     </section>
@@ -565,11 +580,14 @@
     });
 
     const PROCESS_SIZE = 320;
-    const REQUIRED_CLEAR_FRAMES = 4;
     const REQUIRED_STABLE_FRAMES = 2;
     const MIN_OBJECT_BOX_AREA = 0.025;
     const MAX_OBJECT_BOX_AREA = 0.98;
     const MIN_COMPONENT_PIXELS = 380;
+    const PROCESS_INTERVAL_MS = 85;
+    const TRACK_MAX_MISSED_FRAMES = 5;
+    const TRACK_MATCH_DISTANCE = 95;
+    const TRACK_MIN_AGE_TO_INSPECT = 2;
 
     const video = document.getElementById("webcam");
     const stage = document.getElementById("stage");
@@ -615,10 +633,9 @@
     let badSamples = [];
 
     let beltModel = null;
-    let currentItemRecorded = false;
-    let clearFrameCount = 0;
-    let stableFrameCount = 0;
-    let lastBounds = null;
+    let tracks = new Map();
+    let nextTrackId = 1;
+    let lastProcessTime = 0;
 
     const audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
@@ -1070,10 +1087,10 @@
       maskPreviewCtx.putImageData(output, 0, 0);
     }
 
-    function findLargestForegroundComponent(mask, width, height) {
+    function findForegroundComponents(mask, width, height) {
       const visited = new Uint8Array(mask.length);
       const queue = new Int32Array(mask.length);
-      let best = null;
+      const components = [];
 
       for (let startIndex = 0; startIndex < mask.length; startIndex++) {
         if (!mask[startIndex] || visited[startIndex]) continue;
@@ -1133,57 +1150,214 @@
         const aspectRatio = componentWidth / Math.max(1, componentHeight);
         const boxCoverage = boxArea / (width * height);
 
-        // Ignore thin rails, isolated lines and almost-full-frame background changes.
         const plausible =
           aspectRatio >= 0.18 &&
           aspectRatio <= 5.5 &&
-          fillRatio >= 0.08 &&
+          fillRatio >= 0.06 &&
           boxCoverage >= MIN_OBJECT_BOX_AREA &&
           boxCoverage <= MAX_OBJECT_BOX_AREA;
 
         if (!plausible) continue;
 
-        // Prefer a large, filled, roughly rectangular component.
-        const score =
-          count *
-          Math.min(1, fillRatio * 2.5) *
-          Math.min(1, boxCoverage * 4);
+        const paddingX = Math.max(3, Math.round(componentWidth * 0.05));
+        const paddingY = Math.max(3, Math.round(componentHeight * 0.05));
 
-        if (!best || score > best.score) {
-          best = {
-            minX,
-            minY,
-            maxX,
-            maxY,
-            count,
-            fillRatio,
-            score
-          };
+        const x = Math.max(0, minX - paddingX);
+        const y = Math.max(0, minY - paddingY);
+        const right = Math.min(width - 1, maxX + paddingX);
+        const bottom = Math.min(height - 1, maxY + paddingY);
+
+        components.push({
+          x,
+          y,
+          width: right - x + 1,
+          height: bottom - y + 1,
+          pixelCoverage: count / (width * height),
+          boxCoverage:
+            ((right - x + 1) * (bottom - y + 1)) / (width * height),
+          fillRatio
+        });
+      }
+
+      return components;
+    }
+
+    function extractObjectToImageData(imageData, bounds, preview = false) {
+      const source = document.createElement("canvas");
+      const sourceCtx = source.getContext("2d");
+
+      source.width = imageData.width;
+      source.height = imageData.height;
+      sourceCtx.putImageData(imageData, 0, 0);
+
+      const target = preview ? objectPreview : document.createElement("canvas");
+      const targetCtx = preview
+        ? objectPreviewCtx
+        : target.getContext("2d", { willReadFrequently: true });
+
+      target.width = PROCESS_SIZE;
+      target.height = PROCESS_SIZE;
+
+      targetCtx.fillStyle = "#000";
+      targetCtx.fillRect(0, 0, PROCESS_SIZE, PROCESS_SIZE);
+
+      const scale = Math.min(
+        (PROCESS_SIZE * 0.94) / bounds.width,
+        (PROCESS_SIZE * 0.94) / bounds.height
+      );
+
+      const drawWidth = Math.max(1, Math.round(bounds.width * scale));
+      const drawHeight = Math.max(1, Math.round(bounds.height * scale));
+      const dx = Math.round((PROCESS_SIZE - drawWidth) / 2);
+      const dy = Math.round((PROCESS_SIZE - drawHeight) / 2);
+
+      targetCtx.drawImage(
+        source,
+        bounds.x,
+        bounds.y,
+        bounds.width,
+        bounds.height,
+        dx,
+        dy,
+        drawWidth,
+        drawHeight
+      );
+
+      return targetCtx.getImageData(0, 0, PROCESS_SIZE, PROCESS_SIZE);
+    }
+
+    function getProductCandidates(imageData, mask, width, height) {
+      const components = findForegroundComponents(mask, width, height);
+      const candidates = [];
+
+      for (const bounds of components) {
+        if (!isCompleteObject(bounds, width, height)) continue;
+
+        const candidateImage = extractObjectToImageData(
+          imageData,
+          bounds,
+          false
+        );
+        const feature = createFeatureVector(candidateImage);
+        const nearestGood = Math.min(
+          ...goodSamples.map((sample) =>
+            featureDifference(feature, sample.feature)
+          )
+        );
+
+        const centreX = bounds.x + bounds.width / 2;
+        const centreY = bounds.y + bounds.height / 2;
+        const centreDistance = Math.hypot(
+          centreX - width / 2,
+          centreY - height / 2
+        );
+        const maxCentreDistance = Math.hypot(width / 2, height / 2);
+        const centrePenalty = (centreDistance / maxCentreDistance) * 8;
+        const shapePenalty =
+          Math.abs(0.55 - Math.min(1, bounds.fillRatio)) * 7;
+
+        candidates.push({
+          ...bounds,
+          centreX,
+          centreY,
+          candidateImage,
+          nearestGood,
+          selectionScore: nearestGood + centrePenalty + shapePenalty
+        });
+      }
+
+      // Best product-like regions first. Keep several so two close products can
+      // be tracked in the same frame when a visible belt gap separates them.
+      return candidates
+        .sort((a, b) => a.selectionScore - b.selectionScore)
+        .slice(0, 6);
+    }
+
+    function distanceBetweenTrackAndCandidate(track, candidate) {
+      return Math.hypot(
+        track.centreX - candidate.centreX,
+        track.centreY - candidate.centreY
+      );
+    }
+
+    function updateProductTracks(candidates) {
+      const unmatchedTrackIds = new Set(tracks.keys());
+      const assignedCandidates = new Set();
+
+      // Greedy nearest-neighbour matching is sufficient for a fixed camera and
+      // a single conveyor direction, while remaining lightweight in-browser.
+      const possibleMatches = [];
+
+      for (const [trackId, track] of tracks) {
+        for (let i = 0; i < candidates.length; i++) {
+          possibleMatches.push({
+            trackId,
+            candidateIndex: i,
+            distance: distanceBetweenTrackAndCandidate(track, candidates[i])
+          });
         }
       }
 
-      if (!best) return null;
+      possibleMatches.sort((a, b) => a.distance - b.distance);
 
-      const rawWidth = best.maxX - best.minX + 1;
-      const rawHeight = best.maxY - best.minY + 1;
-      const paddingX = Math.max(3, Math.round(rawWidth * 0.05));
-      const paddingY = Math.max(3, Math.round(rawHeight * 0.05));
+      for (const match of possibleMatches) {
+        if (match.distance > TRACK_MATCH_DISTANCE) continue;
+        if (!unmatchedTrackIds.has(match.trackId)) continue;
+        if (assignedCandidates.has(match.candidateIndex)) continue;
 
-      const x = Math.max(0, best.minX - paddingX);
-      const y = Math.max(0, best.minY - paddingY);
-      const right = Math.min(width - 1, best.maxX + paddingX);
-      const bottom = Math.min(height - 1, best.maxY + paddingY);
+        const track = tracks.get(match.trackId);
+        const candidate = candidates[match.candidateIndex];
+        const stable = boundsAreStable(track.bounds, candidate);
 
-      return {
-        x,
-        y,
-        width: right - x + 1,
-        height: bottom - y + 1,
-        pixelCoverage: best.count / (width * height),
-        boxCoverage:
-          ((right - x + 1) * (bottom - y + 1)) / (width * height),
-        fillRatio: best.fillRatio
-      };
+        track.bounds = candidate;
+        track.centreX = candidate.centreX;
+        track.centreY = candidate.centreY;
+        track.imageData = candidate.candidateImage;
+        track.nearestGood = candidate.nearestGood;
+        track.age += 1;
+        track.missedFrames = 0;
+        track.stableFrames = stable ? track.stableFrames + 1 : 1;
+        track.lastSeenAt = performance.now();
+
+        unmatchedTrackIds.delete(match.trackId);
+        assignedCandidates.add(match.candidateIndex);
+      }
+
+      // Existing tracks that were not seen are retained briefly, allowing a
+      // tiny gap, blur or one-frame mask failure without creating a duplicate ID.
+      for (const trackId of unmatchedTrackIds) {
+        const track = tracks.get(trackId);
+        track.missedFrames += 1;
+
+        if (track.missedFrames > TRACK_MAX_MISSED_FRAMES) {
+          tracks.delete(trackId);
+        }
+      }
+
+      // Every unmatched candidate is a genuinely new product track.
+      for (let i = 0; i < candidates.length; i++) {
+        if (assignedCandidates.has(i)) continue;
+
+        const candidate = candidates[i];
+        const id = nextTrackId++;
+
+        tracks.set(id, {
+          id,
+          bounds: candidate,
+          centreX: candidate.centreX,
+          centreY: candidate.centreY,
+          imageData: candidate.candidateImage,
+          nearestGood: candidate.nearestGood,
+          age: 1,
+          stableFrames: 1,
+          missedFrames: 0,
+          inspected: false,
+          result: null,
+          lastSeenAt: performance.now()
+        });
+      }
+
+      return Array.from(tracks.values());
     }
 
     function isCompleteObject(bounds, width, height) {
@@ -1218,44 +1392,7 @@
     }
 
     function extractObject(imageData, bounds) {
-      const source = document.createElement("canvas");
-      const sourceCtx = source.getContext("2d");
-
-      source.width = imageData.width;
-      source.height = imageData.height;
-      sourceCtx.putImageData(imageData, 0, 0);
-
-      objectPreviewCtx.fillStyle = "#000";
-      objectPreviewCtx.fillRect(0, 0, PROCESS_SIZE, PROCESS_SIZE);
-
-      const scale = Math.min(
-        (PROCESS_SIZE * 0.94) / bounds.width,
-        (PROCESS_SIZE * 0.94) / bounds.height
-      );
-
-      const drawWidth = Math.max(1, Math.round(bounds.width * scale));
-      const drawHeight = Math.max(1, Math.round(bounds.height * scale));
-      const dx = Math.round((PROCESS_SIZE - drawWidth) / 2);
-      const dy = Math.round((PROCESS_SIZE - drawHeight) / 2);
-
-      objectPreviewCtx.drawImage(
-        source,
-        bounds.x,
-        bounds.y,
-        bounds.width,
-        bounds.height,
-        dx,
-        dy,
-        drawWidth,
-        drawHeight
-      );
-
-      return objectPreviewCtx.getImageData(
-        0,
-        0,
-        PROCESS_SIZE,
-        PROCESS_SIZE
-      );
+      return extractObjectToImageData(imageData, bounds, true);
     }
 
     function mapBoundsToDisplay(bounds) {
@@ -1274,26 +1411,49 @@
       };
     }
 
-    function drawDetectedBox(bounds, colour, label) {
+    function clearDetectionOverlay() {
       resizeDisplayCanvas();
-
       const rect = stage.getBoundingClientRect();
       displayCtx.clearRect(0, 0, rect.width, rect.height);
+    }
 
-      if (!bounds) return;
+    function drawTrackedBoxes(trackList) {
+      clearDetectionOverlay();
 
-      const mapped = mapBoundsToDisplay(bounds);
+      for (const track of trackList) {
+        if (track.missedFrames > 0) continue;
 
-      displayCtx.lineWidth = 3;
-      displayCtx.strokeStyle = colour;
-      displayCtx.strokeRect(mapped.x, mapped.y, mapped.width, mapped.height);
+        let colour = "#3b82f6";
+        let label = `ID ${track.id} — TRACKING`;
 
-      displayCtx.font = "700 13px -apple-system, sans-serif";
-      const textWidth = displayCtx.measureText(label).width;
-      displayCtx.fillStyle = colour;
-      displayCtx.fillRect(mapped.x, Math.max(0, mapped.y - 22), textWidth + 12, 22);
-      displayCtx.fillStyle = "#ffffff";
-      displayCtx.fillText(label, mapped.x + 6, Math.max(15, mapped.y - 7));
+        if (track.inspected && track.result?.rejected) {
+          colour = "#ef4444";
+          label = `ID ${track.id} — REJECT RECORDED`;
+        } else if (track.inspected) {
+          colour = "#10b981";
+          label = `ID ${track.id} — PASS`;
+        } else if (track.stableFrames < REQUIRED_STABLE_FRAMES) {
+          colour = "#f59e0b";
+          label = `ID ${track.id} — STABILISING`;
+        }
+
+        const mapped = mapBoundsToDisplay(track.bounds);
+        displayCtx.lineWidth = 3;
+        displayCtx.strokeStyle = colour;
+        displayCtx.strokeRect(mapped.x, mapped.y, mapped.width, mapped.height);
+
+        displayCtx.font = "700 12px -apple-system, sans-serif";
+        const textWidth = displayCtx.measureText(label).width;
+        displayCtx.fillStyle = colour;
+        displayCtx.fillRect(
+          mapped.x,
+          Math.max(0, mapped.y - 21),
+          textWidth + 11,
+          21
+        );
+        displayCtx.fillStyle = "#ffffff";
+        displayCtx.fillText(label, mapped.x + 5, Math.max(14, mapped.y - 7));
+      }
     }
 
     function addSample(collection, imageData, type) {
@@ -1380,7 +1540,7 @@
 
       calibrationMessage.textContent =
         `Calibration successful. Belt samples: ${beltSamples.length}, ` +
-        `good samples: ${goodSamples.length}, known rejects: ${badSamples.length}.`;
+        `good samples: ${goodSamples.length}, optional known rejects: ${badSamples.length}.`;
     }
 
     function inspectObject(objectImageData) {
@@ -1392,76 +1552,131 @@
         )
       );
 
-      const nearestBad =
-        badSamples.length > 0
-          ? Math.min(
-              ...badSamples.map((sample) =>
-                featureDifference(currentFeature, sample.feature)
-              )
-            )
-          : Number.POSITIVE_INFINITY;
-
       const failLimit = Number(differenceThreshold.value);
-      const knownReject =
-        nearestBad < nearestGood && nearestBad <= failLimit * 1.15;
-      const abnormal = nearestGood > failLimit;
+      const outsideGoodRange = nearestGood > failLimit;
+
+      let nearestBad = Number.POSITIVE_INFINITY;
+      let knownReject = false;
+
+      // Bad samples are optional and never required for rejection.
+      // They only help explain what kind of rejection was detected.
+      if (outsideGoodRange && badSamples.length > 0) {
+        nearestBad = Math.min(
+          ...badSamples.map((sample) =>
+            featureDifference(currentFeature, sample.feature)
+          )
+        );
+
+        knownReject =
+          nearestBad < nearestGood &&
+          nearestBad <= failLimit * 1.20;
+      }
+
+      if (!outsideGoodRange) {
+        return {
+          rejected: false,
+          nearestGood,
+          nearestBad,
+          reason: "Matches accepted good samples"
+        };
+      }
 
       return {
-        rejected: knownReject || abnormal,
+        rejected: true,
         nearestGood,
         nearestBad,
         reason: knownReject
-          ? "Known reject or different product"
-          : abnormal
-          ? "Artwork or product mismatch"
-          : "Within good sample range"
+          ? "Known reject or wrong product"
+          : "Unknown defect or product mismatch"
       };
     }
 
-    function logReject(result, imageData) {
-      if (currentItemRecorded) return;
+    function logRejectForTrack(track) {
+      if (track.inspected) return;
 
-      currentItemRecorded = true;
+      track.result = inspectObject(track.imageData);
+      track.inspected = true;
+
+      if (!track.result.rejected) return;
+
       incrementRejectCount();
       triggerAlarm();
 
-      const imageURL = imageDataToDataURL(imageData);
+      const imageURL = imageDataToDataURL(track.imageData);
       const item = document.createElement("div");
       item.className = "log-item";
 
       item.innerHTML = `
         <img src="${imageURL}" alt="Rejected product snapshot" />
         <div class="log-info">
-          <strong>Reject #${rejectCount}</strong><br />
+          <strong>Reject #${rejectCount} · Product ID ${track.id}</strong><br />
           ${new Date().toLocaleTimeString()}<br />
-          <span style="color:#f87171">${result.reason}</span><br />
-          Difference from good: ${result.nearestGood.toFixed(1)}%
+          <span style="color:#f87171">${track.result.reason}</span><br />
+          Difference from nearest good: ${track.result.nearestGood.toFixed(1)}%
         </div>
       `;
 
       document.getElementById("logList").prepend(item);
     }
 
-    function handleBeltClear() {
-      clearFrameCount++;
+    function inspectReadyTracks(trackList) {
+      for (const track of trackList) {
+        if (track.inspected || track.missedFrames > 0) continue;
+        if (track.age < TRACK_MIN_AGE_TO_INSPECT) continue;
+        if (track.stableFrames < REQUIRED_STABLE_FRAMES) continue;
 
-      if (clearFrameCount >= REQUIRED_CLEAR_FRAMES) {
-        currentItemRecorded = false;
-        stableFrameCount = 0;
-        lastBounds = null;
-        displayCtx.clearRect(
-          0,
-          0,
-          displayCanvas.width,
-          displayCanvas.height
-        );
+        logRejectForTrack(track);
+
+        if (!track.result?.rejected) {
+          track.result = track.result || inspectObject(track.imageData);
+          track.inspected = true;
+        }
       }
-
-      setStatus("BELT CLEAR", "status-empty");
     }
 
-    function scanLoop() {
+    function updateLiveStatus(trackList, foregroundCoverage) {
+      const visible = trackList.filter((track) => track.missedFrames === 0);
+      const rejects = visible.filter(
+        (track) => track.inspected && track.result?.rejected
+      );
+      const passes = visible.filter(
+        (track) => track.inspected && !track.result?.rejected
+      );
+      const waiting = visible.filter((track) => !track.inspected);
+
+      if (visible.length === 0) {
+        setStatus("BELT CLEAR — READY FOR NEXT PRODUCT", "status-empty");
+      } else if (rejects.length > 0) {
+        setStatus(
+          `REJECT RECORDED — ${visible.length} PRODUCT(S) TRACKED; WAITING FOR EACH TO EXIT`,
+          "status-fail"
+        );
+      } else if (waiting.length > 0) {
+        setStatus(
+          `TRACKING ${visible.length} PRODUCT(S) — ${waiting.length} WAITING FOR INSPECTION`,
+          "status-entering"
+        );
+      } else if (passes.length > 0) {
+        setStatus(
+          `PASS — ${visible.length} PRODUCT(S) TRACKED; READY TO TRACK NEXT GAP`,
+          "status-pass"
+        );
+      } else {
+        setStatus(
+          `SEARCHING (${(foregroundCoverage * 100).toFixed(1)}% FOREGROUND)`,
+          "status-entering"
+        );
+      }
+    }
+
+    function scanLoop(timestamp = 0) {
       if (!scanning) return;
+
+      if (timestamp - lastProcessTime < PROCESS_INTERVAL_MS) {
+        animationFrameId = requestAnimationFrame(scanLoop);
+        return;
+      }
+      lastProcessTime = timestamp;
 
       try {
         if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
@@ -1469,56 +1684,29 @@
           const foreground = createForegroundMask(roiData);
           const trigger = Number(presenceThreshold.value) / 100;
 
-          if (foreground.coverage < trigger) {
-            handleBeltClear();
-          } else {
-            clearFrameCount = 0;
+          let candidates = [];
 
-            const bounds = findLargestForegroundComponent(
+          if (foreground.coverage >= trigger) {
+            candidates = getProductCandidates(
+              roiData,
               foreground.mask,
               roiData.width,
               roiData.height
             );
+          }
 
-            if (!bounds) {
-              setStatus(`OBJECT DETECTED — SEARCHING (${(foreground.coverage * 100).toFixed(1)}% mask)`, "status-entering");
-            } else if (!isCompleteObject(bounds, roiData.width, roiData.height)) {
-              stableFrameCount = 0;
-              lastBounds = bounds;
-              drawDetectedBox(bounds, "#f59e0b", "PRODUCT ENTERING");
-              setStatus("PRODUCT ENTERING — WAITING FOR FULL BOX", "status-entering");
-            } else {
-              if (boundsAreStable(bounds, lastBounds)) {
-                stableFrameCount++;
-              } else {
-                stableFrameCount = 1;
-              }
+          const trackList = updateProductTracks(candidates);
+          inspectReadyTracks(trackList);
+          drawTrackedBoxes(trackList);
+          updateLiveStatus(trackList, foreground.coverage);
 
-              lastBounds = bounds;
-              drawDetectedBox(bounds, "#3b82f6", "PRODUCT FOUND");
+          // Show the newest visible product in the product preview.
+          const newestVisible = trackList
+            .filter((track) => track.missedFrames === 0)
+            .sort((a, b) => b.id - a.id)[0];
 
-              if (stableFrameCount < REQUIRED_STABLE_FRAMES) {
-                setStatus("PRODUCT FOUND — STABILISING", "status-entering");
-              } else {
-                const objectImageData = extractObject(roiData, bounds);
-                const result = inspectObject(objectImageData);
-
-                if (result.rejected) {
-                  drawDetectedBox(bounds, "#ef4444", "REJECT");
-                  setStatus(
-                    `REJECT: ${result.reason} (${result.nearestGood.toFixed(1)}% difference)`,
-                    "status-fail"
-                  );
-                  logReject(result, objectImageData);
-                } else {
-                  drawDetectedBox(bounds, "#10b981", "PASS");
-                  setStatus(
-                    `PASS: ${Math.max(0, 100 - result.nearestGood).toFixed(1)}% similarity`,
-                    "status-pass"
-                  );
-                }
-              }
-            }
+          if (newestVisible?.imageData) {
+            objectPreviewCtx.putImageData(newestVisible.imageData, 0, 0);
           }
         }
       } catch (error) {
@@ -1534,6 +1722,8 @@
         cancelAnimationFrame(animationFrameId);
         scanBtn.textContent = "Start Inspection";
         scanBtn.className = "success";
+        tracks.clear();
+        clearDetectionOverlay();
         setStatus("STATUS: STANDBY", "status-standby");
         return;
       }
@@ -1544,10 +1734,9 @@
       }
 
       scanning = true;
-      currentItemRecorded = false;
-      clearFrameCount = 0;
-      stableFrameCount = 0;
-      lastBounds = null;
+      tracks.clear();
+      nextTrackId = 1;
+      lastProcessTime = 0;
 
       scanBtn.textContent = "Stop Inspection";
       scanBtn.className = "danger";
@@ -1569,7 +1758,7 @@
       if (!name?.trim()) return;
 
       const saved = {
-        version: 1,
+        version: 2,
         name: name.trim(),
         savedAt: new Date().toISOString(),
         roi: ROI,
