@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Spatial Print & Pattern Inspector</title>
+  <title>High-Speed Precision Line Inspector</title>
   <style>
     :root {
       --bg-color: #0f172a;
@@ -38,7 +38,7 @@
     
     .roi-overlay {
       position: absolute;
-      top: 5%; left: 5%; width: 90%; height: 90%;
+      top: 10%; left: 10%; width: 80%; height: 80%;
       border: 2px dashed var(--warning);
       box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45);
       pointer-events: none;
@@ -79,7 +79,7 @@
 
   <header>
     <div>
-      <h1>Spatial Print & Pattern Inspector</h1>
+      <h1>High-Speed Spatial Inspector (Peak-Frame Capture)</h1>
     </div>
     
     <div class="header-actions">
@@ -115,14 +115,14 @@
 
       <div class="slider-group">
         <label>Tolerance Threshold:</label>
-        <input type="range" id="sensitivity" min="1" max="50" value="12">
-        <span id="sensVal">12%</span>
+        <input type="range" id="sensitivity" min="1" max="50" value="15">
+        <span id="sensVal">15%</span>
       </div>
 
       <div class="slider-group">
         <label>Trigger High (Entry):</label>
-        <input type="range" id="presenceSens" min="0.1" max="10" step="0.1" value="1.0">
-        <span id="presenceVal">1.0%</span>
+        <input type="range" id="presenceSens" min="0.5" max="20" step="0.5" value="2.0">
+        <span id="presenceVal">2.0%</span>
       </div>
 
       <div id="liveStatus" class="status-badge status-standby">STATUS: STANDBY</div>
@@ -131,7 +131,7 @@
         <div>
           <div>STATE: <span id="debugState" style="color:#f59e0b;">CLEAR</span></div>
           <div>DELTA: <span id="debugDeltaVal">0.00</span></div>
-          <div>BASE DENSITY: <span id="debugBaseVal">0.00</span></div>
+          <div>PEAK DELTA: <span id="debugPeakVal">0.00</span></div>
         </div>
         <canvas id="debugCanvas" width="64" height="64"></canvas>
       </div>
@@ -212,6 +212,13 @@
     const muteBtn = document.getElementById('muteBtn');
     const profileSelect = document.getElementById('profileSelect');
 
+    const GRID_SIZE = 64; 
+    const BLOCK_SIZE = 4; // 16x16 local evaluation grids
+
+    // Pre-allocated typed memory to eliminate GC stutters
+    const currentFrameVector = new Float32Array(GRID_SIZE * GRID_SIZE * 3);
+    const peakFrameVector = new Float32Array(GRID_SIZE * GRID_SIZE * 3);
+
     let isScanning = false;
     let defectCount = 0;
     
@@ -221,14 +228,13 @@
     let badThumbnails = [];
     let beltBaselineDensity = 0;
 
-    let objectInZone = false; 
-    let currentObjectEvaluated = false;
-    
+    // PEAK SAMPLING STATE TRACKER
+    let objectInZone = false;
+    let currentPassMaxDelta = 0;
+    let peakSnapshotUrl = "";
+
     let isMuted = false;
     let animationFrameId = null;
-
-    const GRID_SIZE = 64; 
-    const BLOCK_SIZE = 4; // 16x16 local block grid
 
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
@@ -266,7 +272,12 @@
       if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop());
       try {
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: facingMode, width: { ideal: 640 }, height: { ideal: 480 } },
+          video: { 
+            facingMode: facingMode, 
+            width: { ideal: 640 }, 
+            height: { ideal: 480 },
+            frameRate: { ideal: 60, min: 30 }
+          },
           audio: false
         });
         video.srcObject = stream;
@@ -280,18 +291,17 @@
       const sw = source.videoWidth || source.width || 640;
       const sh = source.videoHeight || source.height || 480;
       
-      const sx = sw * 0.05;
-      const sy = sh * 0.05;
-      const sWidth = sw * 0.90;
-      const sHeight = sh * 0.90;
+      const sx = sw * 0.10;
+      const sy = sh * 0.10;
+      const sWidth = sw * 0.80;
+      const sHeight = sh * 0.80;
 
       procCtx.drawImage(source, sx, sy, sWidth, sHeight, 0, 0, GRID_SIZE, GRID_SIZE);
       return procCtx.getImageData(0, 0, GRID_SIZE, GRID_SIZE);
     }
 
-    function analyzeFrame(imageData) {
+    function analyzeFrame(imageData, targetVector) {
       const d = imageData.data;
-      const vector = new Float32Array(GRID_SIZE * GRID_SIZE * 3);
       const debugImgData = debugCtx.createImageData(GRID_SIZE, GRID_SIZE);
       const dbg = debugImgData.data;
 
@@ -303,9 +313,9 @@
         const b = d[i+2];
 
         const vecIdx = (i / 4) * 3;
-        vector[vecIdx] = r;
-        vector[vecIdx + 1] = g;
-        vector[vecIdx + 2] = b;
+        targetVector[vecIdx] = r;
+        targetVector[vecIdx + 1] = g;
+        targetVector[vecIdx + 2] = b;
 
         const lum = r * 0.299 + g * 0.587 + b * 0.114;
         totalLum += lum;
@@ -317,7 +327,7 @@
       }
 
       debugCtx.putImageData(debugImgData, 0, 0);
-      return { vector, density: totalLum / (GRID_SIZE * GRID_SIZE) };
+      return totalLum / (GRID_SIZE * GRID_SIZE);
     }
 
     function compareVectors(v1, v2) {
@@ -364,16 +374,16 @@
     function captureBeltFromCamera() {
       if (video.readyState < 2) { alert("Camera stream not ready."); return; }
       const roiData = captureROI(video);
-      const { density } = analyzeFrame(roiData);
-      beltBaselineDensity = density;
-      alert(`Belt Baseline set to ${density.toFixed(2)}`);
+      beltBaselineDensity = analyzeFrame(roiData, currentFrameVector);
+      alert(`Belt Baseline set to ${beltBaselineDensity.toFixed(2)}`);
     }
 
     function captureGoodSample() {
       if (video.readyState < 2) return;
       const roiData = captureROI(video);
-      const { vector } = analyzeFrame(roiData);
-      goodVectors.push(vector);
+      const vec = new Float32Array(GRID_SIZE * GRID_SIZE * 3);
+      analyzeFrame(roiData, vec);
+      goodVectors.push(vec);
       goodThumbnails.push(procCanvas.toDataURL('image/jpeg', 0.8));
       renderStrips();
     }
@@ -382,8 +392,9 @@
       Array.from(e.target.files).forEach(file => {
         const img = new Image();
         img.onload = () => {
-          const { vector } = analyzeFrame(captureROI(img));
-          goodVectors.push(vector);
+          const vec = new Float32Array(GRID_SIZE * GRID_SIZE * 3);
+          analyzeFrame(captureROI(img), vec);
+          goodVectors.push(vec);
           goodThumbnails.push(procCanvas.toDataURL('image/jpeg', 0.8));
           renderStrips();
         };
@@ -394,8 +405,9 @@
     function captureBadSample() {
       if (video.readyState < 2) return;
       const roiData = captureROI(video);
-      const { vector } = analyzeFrame(roiData);
-      badVectors.push(vector);
+      const vec = new Float32Array(GRID_SIZE * GRID_SIZE * 3);
+      analyzeFrame(roiData, vec);
+      badVectors.push(vec);
       badThumbnails.push(procCanvas.toDataURL('image/jpeg', 0.8));
       renderStrips();
     }
@@ -404,8 +416,9 @@
       Array.from(e.target.files).forEach(file => {
         const img = new Image();
         img.onload = () => {
-          const { vector } = analyzeFrame(captureROI(img));
-          badVectors.push(vector);
+          const vec = new Float32Array(GRID_SIZE * GRID_SIZE * 3);
+          analyzeFrame(captureROI(img), vec);
+          badVectors.push(vec);
           badThumbnails.push(procCanvas.toDataURL('image/jpeg', 0.8));
           renderStrips();
         };
@@ -522,66 +535,81 @@
       }
     }
 
+    /* HIGH-SPEED PEAK FRAME EVALUATION LOOP */
     function scanLoop() {
       if (!isScanning) return;
       
       if (video.readyState >= 2) {
         const roiData = captureROI(video);
-        const { vector: currentVector, density: currentDensity } = analyzeFrame(roiData);
-        
+        const currentDensity = analyzeFrame(roiData, currentFrameVector);
         const delta = Math.abs(currentDensity - beltBaselineDensity);
         
         document.getElementById('debugDeltaVal').innerText = delta.toFixed(2);
-        document.getElementById('debugBaseVal').innerText = beltBaselineDensity.toFixed(2);
+        document.getElementById('debugPeakVal').innerText = currentPassMaxDelta.toFixed(2);
 
         const highThreshold = parseFloat(presenceInput.value);
         const lowThreshold = highThreshold * 0.4;
 
-        if (delta < lowThreshold) {
-          objectInZone = false;
-          currentObjectEvaluated = false;
-          beltBaselineDensity = (beltBaselineDensity * 0.95) + (currentDensity * 0.05);
+        // 1. OBJECT IS IN INSPECTION ZONE -> TRACK AND RECORD PEAK FRAME
+        if (delta >= highThreshold) {
+          if (!objectInZone) {
+            objectInZone = true;
+            currentPassMaxDelta = 0; // Reset peak accumulator on new item entry
+          }
 
+          liveStatus.className = "status-badge status-standby";
+          liveStatus.innerText = "TRACKING ITEM PASS...";
+          document.getElementById('debugState').innerText = "TRACKING PEAK";
+          document.getElementById('debugState').style.color = "#3b82f6";
+
+          // If current frame has higher contrast/spatial visual alignment than prior frames, lock it down as peak
+          if (delta > currentPassMaxDelta) {
+            currentPassMaxDelta = delta;
+            peakFrameVector.set(currentFrameVector);
+            peakSnapshotUrl = procCanvas.toDataURL('image/jpeg', 0.85);
+          }
+        } 
+        // 2. OBJECT HAS EXITED ZONE -> EVALUATE SINGLE OPTIMAL PEAK SNAPSHOT
+        else if (delta < lowThreshold && objectInZone) {
+          objectInZone = false; // Reset lock for next item
+
+          // Execute Pass/Fail decision on stored PEAK frame
+          let minGoodDiff = Math.min(...goodVectors.map(v => compareVectors(v, peakFrameVector)));
+          let minBadDiff = badVectors.length > 0 ? Math.min(...badVectors.map(v => compareVectors(v, peakFrameVector))) : 999;
+
+          const defectLimit = parseFloat(sensitivityInput.value);
+          const isRejectMatch = minBadDiff < minGoodDiff && minBadDiff < defectLimit;
+          const isDeviation = minGoodDiff > defectLimit;
+
+          if (isDeviation || isRejectMatch) {
+            liveStatus.className = "status-badge status-fail";
+            liveStatus.innerText = `DEFECT DETECTED (${minGoodDiff.toFixed(1)}% Variance)`;
+            triggerAlarm();
+            logDefect(minGoodDiff, peakSnapshotUrl);
+          } else {
+            liveStatus.className = "status-badge status-pass";
+            liveStatus.innerText = `PASS (${minGoodDiff.toFixed(1)}% Difference)`;
+          }
+
+          // Smooth background auto-exposure drift during belt gap
+          beltBaselineDensity = (beltBaselineDensity * 0.90) + (currentDensity * 0.10);
+        }
+        // 3. IDLE BELT STATE
+        else if (!objectInZone) {
+          beltBaselineDensity = (beltBaselineDensity * 0.98) + (currentDensity * 0.02);
           liveStatus.className = "status-badge status-empty";
           liveStatus.innerText = "BELT CLEAR";
           document.getElementById('debugState').innerText = "CLEAR";
           document.getElementById('debugState').style.color = "#f59e0b";
-        } 
-        else if (delta >= highThreshold) {
-          objectInZone = true;
-          document.getElementById('debugState').innerText = "OBJECT IN ZONE";
-          document.getElementById('debugState').style.color = "#3b82f6";
-
-          if (!currentObjectEvaluated) {
-            let minGoodDiff = Math.min(...goodVectors.map(v => compareVectors(v, currentVector)));
-            let minBadDiff = badVectors.length > 0 ? Math.min(...badVectors.map(v => compareVectors(v, currentVector))) : 999;
-
-            const defectLimit = parseFloat(sensitivityInput.value);
-            const isRejectMatch = minBadDiff < minGoodDiff && minBadDiff < defectLimit;
-            const isDeviation = minGoodDiff > defectLimit;
-
-            if (isDeviation || isRejectMatch) {
-              liveStatus.className = "status-badge status-fail";
-              liveStatus.innerText = `DEFECT DETECTED (${minGoodDiff.toFixed(1)}% Spatial Variance)`;
-              triggerAlarm();
-              logDefect(minGoodDiff);
-            } else {
-              liveStatus.className = "status-badge status-pass";
-              liveStatus.innerText = `PASS (${minGoodDiff.toFixed(1)}% Difference)`;
-            }
-
-            currentObjectEvaluated = true;
-          }
         }
       }
 
       animationFrameId = requestAnimationFrame(scanLoop);
     }
 
-    function logDefect(score) {
+    function logDefect(score, snapshotUrl) {
       defectCount++;
       document.getElementById('defectCount').innerText = defectCount;
-      const snapshotUrl = procCanvas.toDataURL('image/jpeg', 0.8);
 
       const logItem = document.createElement('div');
       logItem.className = 'log-item';
@@ -589,7 +617,7 @@
         <img src="${snapshotUrl}"/>
         <div class="log-info">
           <strong>Defect #${defectCount}</strong> - ${new Date().toLocaleTimeString()}<br/>
-          <span style="color:var(--danger)">Max Block Shift: ${score.toFixed(1)}%</span>
+          <span style="color:var(--danger)">Max Block Variance: ${score.toFixed(1)}%</span>
         </div>
       `;
       logList.insertBefore(logItem, logList.firstChild);
