@@ -1,200 +1,3 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Spatial Edge & Print Quality Inspector</title>
-  <style>
-    :root {
-      --bg-color: #0f172a;
-      --card-bg: #1e293b;
-      --accent: #3b82f6;
-      --danger: #ef4444;
-      --success: #10b981;
-      --warning: #f59e0b;
-      --text: #f8fafc;
-      --text-muted: #94a3b8;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    body { background-color: var(--bg-color); color: var(--text); padding: 10px; }
-    
-    header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 10px; padding-bottom: 8px; border-bottom: 1px solid #334155; }
-    h1 { font-size: 0.95rem; }
-
-    .header-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-    .counter-box { background: rgba(239, 68, 68, 0.15); border: 1px solid var(--danger); padding: 2px 8px; border-radius: 6px; text-align: center; display: flex; align-items: center; gap: 6px; }
-    .counter-val { font-size: 1.1rem; font-weight: bold; color: var(--danger); }
-    
-    .profile-select { background: #0f172a; color: var(--text); border: 1px solid #475569; padding: 5px; border-radius: 6px; font-size: 0.75rem; }
-
-    .grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
-    @media(min-width: 768px) { .grid { grid-template-columns: 1fr 1fr; } }
-
-    .card { background: var(--card-bg); border-radius: 10px; padding: 10px; border: 1px solid #334155; }
-    .card h2 { font-size: 0.85rem; margin-bottom: 6px; color: var(--accent); }
-
-    .video-container { position: relative; width: 100%; height: 260px; background: #000; border-radius: 8px; overflow: hidden; display: flex; align-items: center; justify-content: center; }
-    video { width: 100%; height: 100%; object-fit: contain; }
-    
-    .roi-overlay {
-      position: absolute;
-      top: 5%; left: 5%; width: 90%; height: 90%;
-      border: 2px dashed var(--warning);
-      box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45);
-      pointer-events: none;
-      border-radius: 6px;
-      display: flex;
-      align-items: flex-start;
-      justify-content: center;
-    }
-    .roi-label { background: var(--warning); color: #000; font-size: 0.6rem; font-weight: bold; padding: 2px 6px; border-radius: 0 0 4px 4px; }
-
-    .controls { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
-    button, label.btn-upload { background: var(--accent); color: white; border: none; padding: 7px 10px; border-radius: 6px; font-size: 0.75rem; font-weight: bold; cursor: pointer; display: inline-block; text-align: center; }
-    input[type="file"] { display: none; }
-    
-    .status-badge { display: inline-block; padding: 8px; border-radius: 6px; font-size: 0.85rem; font-weight: bold; margin-top: 6px; width: 100%; text-align: center; }
-    .status-pass { background: var(--success); }
-    .status-fail { background: var(--danger); }
-    .status-empty { background: #334155; color: var(--text-muted); }
-    .status-standby { background: var(--warning); color: #000; }
-
-    .slider-group { margin-top: 6px; font-size: 0.72rem; display: flex; align-items: center; gap: 6px; }
-    .slider-group input { flex-grow: 1; }
-
-    .sample-strip { display: flex; gap: 6px; margin-top: 4px; overflow-x: auto; padding-bottom: 4px; min-height: 44px; align-items: center; }
-    .sample-thumb-good { width: 40px; height: 40px; border-radius: 4px; border: 2px solid var(--success); object-fit: cover; }
-    .sample-thumb-bad { width: 40px; height: 40px; border-radius: 4px; border: 2px solid var(--danger); object-fit: cover; }
-
-    .log-list { max-height: 150px; overflow-y: auto; margin-top: 6px; }
-    .log-item { display: flex; gap: 8px; background: #090d16; padding: 6px; border-radius: 6px; margin-bottom: 4px; border-left: 4px solid var(--danger); align-items: center; }
-    .log-item img { width: 36px; height: 36px; object-fit: cover; border-radius: 4px; }
-    .log-info { font-size: 0.72rem; }
-
-    .debug-box { background: #000; padding: 6px; border-radius: 6px; margin-top: 8px; font-family: monospace; font-size: 0.65rem; color: #10b981; display: flex; justify-content: space-between; align-items: center; }
-    #debugCanvas { border: 1px solid #334155; width: 64px; height: 64px; image-rendering: pixelated; }
-  </style>
-</head>
-<body>
-
-  <header>
-    <div>
-      <h1>Spatial Print & Pattern Inspector</h1>
-    </div>
-    
-    <div class="header-actions">
-      <select id="profileSelect" class="profile-select" onchange="loadSelectedProfile()">
-        <option value="">-- Load Profile --</option>
-      </select>
-
-      <button id="muteBtn" onclick="toggleMute()" style="background: #334155; padding: 5px 8px; font-size: 0.75rem;">🔊 Alarm</button>
-      
-      <div class="counter-box">
-        <div style="font-size: 0.6rem;">REJECTS:</div>
-        <div id="defectCount" class="counter-val">0</div>
-        <button onclick="resetCount()" style="background: var(--danger); padding: 2px 5px; font-size: 0.6rem;">Reset</button>
-      </div>
-    </div>
-  </header>
-
-  <div class="grid">
-    <div class="card">
-      <h2>Live Camera Feed</h2>
-      <div class="video-container">
-        <video id="webcam" autoplay playsinline muted></video>
-        <div class="roi-overlay">
-          <span class="roi-label">INSPECTION ZONE</span>
-        </div>
-      </div>
-      
-      <div class="controls">
-        <button onclick="startCamera('environment')">Rear Cam</button>
-        <button onclick="startCamera('user')">Front Cam</button>
-        <button id="toggleScanBtn" onclick="toggleScanning()" style="background: var(--success);">Start Inspection</button>
-      </div>
-
-      <div class="slider-group">
-        <label>Tolerance Threshold:</label>
-        <input type="range" id="sensitivity" min="1" max="50" value="12">
-        <span id="sensVal">12%</span>
-      </div>
-
-      <div class="slider-group">
-        <label>Trigger High (Entry):</label>
-        <input type="range" id="presenceSens" min="0.1" max="10" step="0.1" value="1.0">
-        <span id="presenceVal">1.0%</span>
-      </div>
-
-      <div id="liveStatus" class="status-badge status-standby">STATUS: STANDBY</div>
-
-      <div class="debug-box">
-        <div>
-          <div>STATE: <span id="debugState" style="color:#f59e0b;">CLEAR</span></div>
-          <div>DELTA: <span id="debugDeltaVal">0.00</span></div>
-          <div>BASE DENSITY: <span id="debugBaseVal">0.00</span></div>
-        </div>
-        <canvas id="debugCanvas" width="64" height="64"></canvas>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>Profiles & Samples</h2>
-
-      <div style="margin-bottom: 6px; background: #0f172a; padding: 6px; border-radius: 6px;">
-        <strong style="font-size: 0.72rem; color: var(--accent);">Profile Memory</strong>
-        <div class="controls" style="margin-top: 4px;">
-          <button onclick="saveCurrentProfile()" style="background: #2563eb;">💾 Save Profile</button>
-          <button onclick="deleteSelectedProfile()" style="background: #475569;">🗑️ Delete</button>
-        </div>
-      </div>
-      
-      <div style="margin-bottom: 4px;">
-        <strong style="font-size: 0.72rem; color: var(--text-muted);">1. Belt Baseline</strong>
-        <div class="controls" style="margin-top: 2px;">
-          <button onclick="captureBeltFromCamera()" style="background: #334155;">Snap Empty Belt Baseline</button>
-        </div>
-      </div>
-
-      <hr style="border: 0; border-top: 1px solid #334155; margin: 4px 0;">
-
-      <div style="margin-bottom: 4px;">
-        <strong style="font-size: 0.72rem; color: var(--success);">2. Target Samples (<span id="goodCount">0</span>)</strong>
-        <div id="goodStrip" class="sample-strip"></div>
-        <div class="controls" style="margin-top: 2px;">
-          <button onclick="captureGoodSample()" style="background: var(--success);">+ Snap Good</button>
-          <label class="btn-upload" style="background: var(--success);">
-            📁 Upload
-            <input type="file" accept="image/*" multiple onchange="uploadGoodImage(event)">
-          </label>
-          <button onclick="clearGoodSamples()" style="background: #334155;">Clear</button>
-        </div>
-      </div>
-
-      <hr style="border: 0; border-top: 1px solid #334155; margin: 4px 0;">
-
-      <div>
-        <strong style="font-size: 0.72rem; color: var(--danger);">3. Defect Bank (<span id="badCount">0</span>)</strong>
-        <div id="badStrip" class="sample-strip"></div>
-        <div class="controls" style="margin-top: 2px;">
-          <button onclick="captureBadSample()" style="background: var(--danger);">+ Snap Reject</button>
-          <label class="btn-upload" style="background: var(--danger);">
-            📁 Upload
-            <input type="file" accept="image/*" multiple onchange="uploadBadImage(event)">
-          </label>
-          <button onclick="clearBadSamples()" style="background: #334155;">Clear</button>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div class="card" style="margin-top: 10px;">
-    <h2>Defect Audit Log</h2>
-    <div id="logList" class="log-list"></div>
-  </div>
-
-  <canvas id="procCanvas" width="64" height="64" style="display:none;"></canvas>
-
-  <script>
     const video = document.getElementById('webcam');
     const procCanvas = document.getElementById('procCanvas');
     const procCtx = procCanvas.getContext('2d', { willReadFrequently: true });
@@ -221,12 +24,14 @@
     let badThumbnails = [];
     let beltBaselineDensity = 0;
 
-    // STATE MACHINE FLAGS
     let objectInZone = false; 
     let currentObjectEvaluated = false;
     
     let isMuted = false;
     let animationFrameId = null;
+
+    const GRID_SIZE = 64; // 64x64 Spatial Matrix
+    const BLOCK_SIZE = 4; // 4x4 Blocks (16x16 grid zones for localized defects)
 
     const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
@@ -283,45 +88,84 @@
       const sWidth = sw * 0.90;
       const sHeight = sh * 0.90;
 
-      procCtx.drawImage(source, sx, sy, sWidth, sHeight, 0, 0, 64, 64);
-      return procCtx.getImageData(0, 0, 64, 64);
+      procCtx.drawImage(source, sx, sy, sWidth, sHeight, 0, 0, GRID_SIZE, GRID_SIZE);
+      return procCtx.getImageData(0, 0, GRID_SIZE, GRID_SIZE);
     }
 
-    // SPATIAL LUMINANCE & PRINT EDGE EXTRACTOR
+    // MULTI-CHANNEL COLOR & SPATIAL FEATURE EXTRACTOR
     function analyzeFrame(imageData) {
       const d = imageData.data;
-      const vector = new Float32Array(64 * 64);
-      const debugImgData = debugCtx.createImageData(64, 64);
+      const vector = new Float32Array(GRID_SIZE * GRID_SIZE * 3); // RGB Channels
+      const debugImgData = debugCtx.createImageData(GRID_SIZE, GRID_SIZE);
       const dbg = debugImgData.data;
 
       let totalLum = 0;
 
       for (let i = 0; i < d.length; i += 4) {
-        // High-precision perceptual luminance
-        const lum = d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114;
-        const pxIdx = i / 4;
-        
-        vector[pxIdx] = lum;
+        const r = d[i];
+        const g = d[i+1];
+        const b = d[i+2];
+
+        const vecIdx = (i / 4) * 3;
+        vector[vecIdx] = r;
+        vector[vecIdx + 1] = g;
+        vector[vecIdx + 2] = b;
+
+        const lum = r * 0.299 + g * 0.587 + b * 0.114;
         totalLum += lum;
 
-        // Visual debug matrix rendering
-        dbg[i] = lum;
-        dbg[i+1] = lum;
-        dbg[i+2] = lum;
+        dbg[i] = r;
+        dbg[i+1] = g;
+        dbg[i+2] = b;
         dbg[i+3] = 255;
       }
 
       debugCtx.putImageData(debugImgData, 0, 0);
-      return { vector, density: totalLum / (64 * 64) };
+      return { vector, density: totalLum / (GRID_SIZE * GRID_SIZE) };
     }
 
-    // MEAN ABSOLUTE SPATIAL DIFFERENCING (Direct Print Comparison)
+    // LOCALIZED BLOCK SPATIAL COMPARISON
+    // Flags defects if whole-image shift occurs OR if any localized block differs significantly
     function compareVectors(v1, v2) {
-      let totalDiff = 0;
-      for (let i = 0; i < v1.length; i++) {
-        totalDiff += Math.abs(v1[i] - v2[i]);
+      let maxBlockDiff = 0;
+      let globalDiffSum = 0;
+
+      const blocksPerRow = GRID_SIZE / BLOCK_SIZE;
+
+      for (let by = 0; by < blocksPerRow; by++) {
+        for (let bx = 0; bx < blocksPerRow; bx++) {
+          let blockDiff = 0;
+          let blockPixels = 0;
+
+          for (let py = 0; py < BLOCK_SIZE; py++) {
+            for (let px = 0; px < BLOCK_SIZE; px++) {
+              const x = bx * BLOCK_SIZE + px;
+              const y = by * BLOCK_SIZE + py;
+              const idx = (y * GRID_SIZE + x) * 3;
+
+              const dr = Math.abs(v1[idx] - v2[idx]);
+              const dg = Math.abs(v1[idx + 1] - v2[idx + 1]);
+              const db = Math.abs(v1[idx + 2] - v2[idx + 2]);
+
+              const pxDiff = (dr + dg + db) / 3;
+              blockDiff += pxDiff;
+              globalDiffSum += pxDiff;
+              blockPixels++;
+            }
+          }
+
+          const avgBlockDiff = blockDiff / blockPixels;
+          if (avgBlockDiff > maxBlockDiff) {
+            maxBlockDiff = avgBlockDiff;
+          }
+        }
       }
-      return (totalDiff / (v1.length * 255)) * 100;
+
+      const globalPercent = (globalDiffSum / (v1.length * 255)) * 100;
+      const maxBlockPercent = (maxBlockDiff / 255) * 100;
+
+      // Combined score weighing local edge localized failures higher
+      return Math.max(globalPercent * 1.5, maxBlockPercent);
     }
 
     function captureBeltFromCamera() {
@@ -399,8 +243,6 @@
       document.getElementById('badCount').innerText = badThumbnails.length;
     }
 
-    /* === LOCAL STORAGE PROFILES === */
-
     function saveCurrentProfile() {
       if (goodVectors.length === 0) { alert("Add at least ONE good target sample first."); return; }
       const name = prompt("Name this product profile:");
@@ -470,8 +312,6 @@
       }
     }
 
-    /* === HYSTERESIS SCAN ENGINE LOOP === */
-
     function toggleScanning() {
       if (goodVectors.length === 0) { alert("Load a Profile or add Good Samples first!"); return; }
       isScanning = !isScanning;
@@ -502,14 +342,11 @@
         document.getElementById('debugBaseVal').innerText = beltBaselineDensity.toFixed(2);
 
         const highThreshold = parseFloat(presenceInput.value);
-        const lowThreshold = highThreshold * 0.4; // Low clearing threshold (40% of trigger)
+        const lowThreshold = highThreshold * 0.4;
 
-        // 1. CLEAR GAP STATE (Belt Empty)
         if (delta < lowThreshold) {
           objectInZone = false;
-          currentObjectEvaluated = false; // Reset evaluation lock for the next arriving object
-          
-          // Smooth out camera auto-exposure shifts during gaps
+          currentObjectEvaluated = false;
           beltBaselineDensity = (beltBaselineDensity * 0.95) + (currentDensity * 0.05);
 
           liveStatus.className = "status-badge status-empty";
@@ -517,13 +354,11 @@
           document.getElementById('debugState').innerText = "CLEAR";
           document.getElementById('debugState').style.color = "#f59e0b";
         } 
-        // 2. OBJECT ENTERED INSPECTION ZONE
         else if (delta >= highThreshold) {
           objectInZone = true;
           document.getElementById('debugState').innerText = "OBJECT IN ZONE";
           document.getElementById('debugState').style.color = "#3b82f6";
 
-          // Evaluate once per item passage
           if (!currentObjectEvaluated) {
             let minGoodDiff = Math.min(...goodVectors.map(v => compareVectors(v, currentVector)));
             let minBadDiff = badVectors.length > 0 ? Math.min(...badVectors.map(v => compareVectors(v, currentVector))) : 999;
@@ -534,15 +369,15 @@
 
             if (isDeviation || isRejectMatch) {
               liveStatus.className = "status-badge status-fail";
-              liveStatus.innerText = `DEFECT DETECTED (${minGoodDiff.toFixed(1)}% Spatial Shift)`;
+              liveStatus.innerText = `DEFECT DETECTED (${minGoodDiff.toFixed(1)}% Spatial Variance)`;
               triggerAlarm();
               logDefect(minGoodDiff);
             } else {
               liveStatus.className = "status-badge status-pass";
-              liveStatus.innerText = `PASS (${minGoodDiff.toFixed(1)}% Match)`;
+              liveStatus.innerText = `PASS (${minGoodDiff.toFixed(1)}% Difference)`;
             }
 
-            currentObjectEvaluated = true; // Lock further evaluations until zone completely clears
+            currentObjectEvaluated = true;
           }
         }
       }
@@ -561,7 +396,7 @@
         <img src="${snapshotUrl}"/>
         <div class="log-info">
           <strong>Defect #${defectCount}</strong> - ${new Date().toLocaleTimeString()}<br/>
-          <span style="color:var(--danger)">Spatial Variance: ${score.toFixed(1)}%</span>
+          <span style="color:var(--danger)">Max Block Shift: ${score.toFixed(1)}%</span>
         </div>
       `;
       logList.insertBefore(logItem, logList.firstChild);
@@ -571,6 +406,3 @@
       startCamera('environment');
       populateProfileDropdown();
     };
-  </script>
-</body>
-</html>
