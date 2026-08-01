@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>High-Speed Precision Line Inspector</title>
+  <title>Smart Feature Line Inspector</title>
   <style>
     :root {
       --bg-color: #0f172a;
@@ -79,7 +79,7 @@
 
   <header>
     <div>
-      <h1>High-Speed Spatial Inspector (Peak-Frame Capture)</h1>
+      <h1>Smart Feature Inspector (Edge & Orientation Invariant)</h1>
     </div>
     
     <div class="header-actions">
@@ -114,14 +114,14 @@
       </div>
 
       <div class="slider-group">
-        <label>Tolerance Threshold:</label>
-        <input type="range" id="sensitivity" min="1" max="50" value="15">
-        <span id="sensVal">15%</span>
+        <label>Defect Sensitivity:</label>
+        <input type="range" id="sensitivity" min="5" max="60" value="25">
+        <span id="sensVal">25%</span>
       </div>
 
       <div class="slider-group">
-        <label>Trigger High (Entry):</label>
-        <input type="range" id="presenceSens" min="0.5" max="20" step="0.5" value="2.0">
+        <label>Object Entry Trigger:</label>
+        <input type="range" id="presenceSens" min="0.5" max="10" step="0.2" value="2.0">
         <span id="presenceVal">2.0%</span>
       </div>
 
@@ -130,35 +130,35 @@
       <div class="debug-box">
         <div>
           <div>STATE: <span id="debugState" style="color:#f59e0b;">CLEAR</span></div>
-          <div>DELTA: <span id="debugDeltaVal">0.00</span></div>
-          <div>PEAK DELTA: <span id="debugPeakVal">0.00</span></div>
+          <div>EDGE DELTA: <span id="debugDeltaVal">0.00</span></div>
+          <div>PEAK EDGE: <span id="debugPeakVal">0.00</span></div>
         </div>
         <canvas id="debugCanvas" width="64" height="64"></canvas>
       </div>
     </div>
 
     <div class="card">
-      <h2>Profiles & Samples</h2>
+      <h2>Profiles & Target Bank</h2>
 
       <div style="margin-bottom: 6px; background: #0f172a; padding: 6px; border-radius: 6px;">
-        <strong style="font-size: 0.72rem; color: var(--accent);">Profile Memory</strong>
+        <strong style="font-size: 0.72rem; color: var(--accent);">Profile Storage</strong>
         <div class="controls" style="margin-top: 4px;">
           <button onclick="saveCurrentProfile()" style="background: #2563eb;">💾 Save Profile</button>
-          <button onclick="deleteSelectedProfile()" style="background: #475569;">🗑️ Delete</button>
+          <button onclick="deleteSelectedProfile()" style="background: #475569;">🗑️ Delete Profile</button>
         </div>
       </div>
       
       <div style="margin-bottom: 4px;">
-        <strong style="font-size: 0.72rem; color: var(--text-muted);">1. Belt Baseline</strong>
+        <strong style="font-size: 0.72rem; color: var(--text-muted);">1. Belt Calibration</strong>
         <div class="controls" style="margin-top: 2px;">
-          <button onclick="captureBeltFromCamera()" style="background: #334155;">Snap Empty Belt Baseline</button>
+          <button onclick="captureBeltFromCamera()" style="background: #334155;">Set Empty Belt Baseline</button>
         </div>
       </div>
 
       <hr style="border: 0; border-top: 1px solid #334155; margin: 4px 0;">
 
       <div style="margin-bottom: 4px;">
-        <strong style="font-size: 0.72rem; color: var(--success);">2. Target Samples (<span id="goodCount">0</span>)</strong>
+        <strong style="font-size: 0.72rem; color: var(--success);">2. Target Good Samples (<span id="goodCount">0</span>)</strong>
         <div id="goodStrip" class="sample-strip"></div>
         <div class="controls" style="margin-top: 2px;">
           <button onclick="captureGoodSample()" style="background: var(--success);">+ Snap Good</button>
@@ -166,7 +166,7 @@
             📁 Upload
             <input type="file" accept="image/*" multiple onchange="uploadGoodImage(event)">
           </label>
-          <button onclick="clearGoodSamples()" style="background: #334155;">Clear</button>
+          <button onclick="clearGoodSamples()" style="background: #334155;">Clear All</button>
         </div>
       </div>
 
@@ -181,7 +181,7 @@
             📁 Upload
             <input type="file" accept="image/*" multiple onchange="uploadBadImage(event)">
           </label>
-          <button onclick="clearBadSamples()" style="background: #334155;">Clear</button>
+          <button onclick="clearBadSamples()" style="background: #334155;">Clear All</button>
         </div>
       </div>
     </div>
@@ -213,11 +213,10 @@
     const profileSelect = document.getElementById('profileSelect');
 
     const GRID_SIZE = 64; 
-    const BLOCK_SIZE = 4; // 16x16 local evaluation grids
 
-    // Pre-allocated typed memory to eliminate GC stutters
-    const currentFrameVector = new Float32Array(GRID_SIZE * GRID_SIZE * 3);
-    const peakFrameVector = new Float32Array(GRID_SIZE * GRID_SIZE * 3);
+    // Pre-allocated typed arrays to prevent GC frame stutter
+    const currentEdgeVector = new Float32Array(GRID_SIZE * GRID_SIZE);
+    const peakEdgeVector = new Float32Array(GRID_SIZE * GRID_SIZE);
 
     let isScanning = false;
     let defectCount = 0;
@@ -226,11 +225,10 @@
     let goodThumbnails = [];
     let badVectors = [];
     let badThumbnails = [];
-    let beltBaselineDensity = 0;
+    let beltBaselineEdgeEnergy = 0;
 
-    // PEAK SAMPLING STATE TRACKER
     let objectInZone = false;
-    let currentPassMaxDelta = 0;
+    let currentPassMaxEnergy = 0;
     let peakSnapshotUrl = "";
 
     let isMuted = false;
@@ -300,89 +298,78 @@
       return procCtx.getImageData(0, 0, GRID_SIZE, GRID_SIZE);
     }
 
-    function analyzeFrame(imageData, targetVector) {
+    // SOBEL GRADIENT FEATURE EXTRACTOR
+    // Converts raw RGB into edge structural maps resistant to lighting shifts
+    function extractEdgeFeatures(imageData, targetVector) {
       const d = imageData.data;
+      const gray = new Float32Array(GRID_SIZE * GRID_SIZE);
+
+      for (let i = 0; i < d.length; i += 4) {
+        gray[i / 4] = d[i] * 0.299 + d[i+1] * 0.587 + d[i+2] * 0.114;
+      }
+
+      let totalEnergy = 0;
       const debugImgData = debugCtx.createImageData(GRID_SIZE, GRID_SIZE);
       const dbg = debugImgData.data;
 
-      let totalLum = 0;
+      for (let y = 1; y < GRID_SIZE - 1; y++) {
+        for (let x = 1; x < GRID_SIZE - 1; x++) {
+          const idx = y * GRID_SIZE + x;
 
-      for (let i = 0; i < d.length; i += 4) {
-        const r = d[i];
-        const g = d[i+1];
-        const b = d[i+2];
+          const gx = 
+            -gray[idx - GRID_SIZE - 1] + gray[idx - GRID_SIZE + 1] +
+            -2 * gray[idx - 1] + 2 * gray[idx + 1] +
+            -gray[idx + GRID_SIZE - 1] + gray[idx + GRID_SIZE + 1];
 
-        const vecIdx = (i / 4) * 3;
-        targetVector[vecIdx] = r;
-        targetVector[vecIdx + 1] = g;
-        targetVector[vecIdx + 2] = b;
+          const gy = 
+            -gray[idx - GRID_SIZE - 1] - 2 * gray[idx - GRID_SIZE] - gray[idx - GRID_SIZE + 1] +
+             gray[idx + GRID_SIZE - 1] + 2 * gray[idx + GRID_SIZE] + gray[idx + GRID_SIZE + 1];
 
-        const lum = r * 0.299 + g * 0.587 + b * 0.114;
-        totalLum += lum;
+          const mag = Math.min(255, Math.sqrt(gx * gx + gy * gy));
+          targetVector[idx] = mag;
+          totalEnergy += mag;
 
-        dbg[i] = r;
-        dbg[i+1] = g;
-        dbg[i+2] = b;
-        dbg[i+3] = 255;
-      }
-
-      debugCtx.putImageData(debugImgData, 0, 0);
-      return totalLum / (GRID_SIZE * GRID_SIZE);
-    }
-
-    function compareVectors(v1, v2) {
-      let maxBlockDiff = 0;
-      let globalDiffSum = 0;
-
-      const blocksPerRow = GRID_SIZE / BLOCK_SIZE;
-
-      for (let by = 0; by < blocksPerRow; by++) {
-        for (let bx = 0; bx < blocksPerRow; bx++) {
-          let blockDiff = 0;
-          let blockPixels = 0;
-
-          for (let py = 0; py < BLOCK_SIZE; py++) {
-            for (let px = 0; px < BLOCK_SIZE; px++) {
-              const x = bx * BLOCK_SIZE + px;
-              const y = by * BLOCK_SIZE + py;
-              const idx = (y * GRID_SIZE + x) * 3;
-
-              const dr = Math.abs(v1[idx] - v2[idx]);
-              const dg = Math.abs(v1[idx + 1] - v2[idx + 1]);
-              const db = Math.abs(v1[idx + 2] - v2[idx + 2]);
-
-              const pxDiff = (dr + dg + db) / 3;
-              blockDiff += pxDiff;
-              globalDiffSum += pxDiff;
-              blockPixels++;
-            }
-          }
-
-          const avgBlockDiff = blockDiff / blockPixels;
-          if (avgBlockDiff > maxBlockDiff) {
-            maxBlockDiff = avgBlockDiff;
-          }
+          const dbgIdx = idx * 4;
+          dbg[dbgIdx] = mag;
+          dbg[dbgIdx + 1] = mag;
+          dbg[dbgIdx + 2] = mag;
+          dbg[dbgIdx + 3] = 255;
         }
       }
 
-      const globalPercent = (globalDiffSum / (v1.length * 255)) * 100;
-      const maxBlockPercent = (maxBlockDiff / 255) * 100;
+      debugCtx.putImageData(debugImgData, 0, 0);
+      return totalEnergy / (GRID_SIZE * GRID_SIZE);
+    }
 
-      return Math.max(globalPercent * 1.5, maxBlockPercent);
+    // MULTI-ORIENTATION COMPARISON
+    // Checks standard alignment and 180-degree flip to avoid false rejects on rotated packages
+    function compareEdgeVectors(v1, v2) {
+      let diffSumNormal = 0;
+      let diffSumFlipped = 0;
+      const len = GRID_SIZE * GRID_SIZE;
+
+      for (let i = 0; i < len; i++) {
+        const flippedIdx = len - 1 - i;
+        diffSumNormal += Math.abs(v1[i] - v2[i]);
+        diffSumFlipped += Math.abs(v1[i] - v2[flippedIdx]);
+      }
+
+      const bestDiff = Math.min(diffSumNormal, diffSumFlipped);
+      return (bestDiff / (len * 255)) * 100;
     }
 
     function captureBeltFromCamera() {
       if (video.readyState < 2) { alert("Camera stream not ready."); return; }
       const roiData = captureROI(video);
-      beltBaselineDensity = analyzeFrame(roiData, currentFrameVector);
-      alert(`Belt Baseline set to ${beltBaselineDensity.toFixed(2)}`);
+      beltBaselineEdgeEnergy = extractEdgeFeatures(roiData, currentEdgeVector);
+      alert(`Belt Edge Baseline set to ${beltBaselineEdgeEnergy.toFixed(2)}`);
     }
 
     function captureGoodSample() {
       if (video.readyState < 2) return;
       const roiData = captureROI(video);
-      const vec = new Float32Array(GRID_SIZE * GRID_SIZE * 3);
-      analyzeFrame(roiData, vec);
+      const vec = new Float32Array(GRID_SIZE * GRID_SIZE);
+      extractEdgeFeatures(roiData, vec);
       goodVectors.push(vec);
       goodThumbnails.push(procCanvas.toDataURL('image/jpeg', 0.8));
       renderStrips();
@@ -392,8 +379,8 @@
       Array.from(e.target.files).forEach(file => {
         const img = new Image();
         img.onload = () => {
-          const vec = new Float32Array(GRID_SIZE * GRID_SIZE * 3);
-          analyzeFrame(captureROI(img), vec);
+          const vec = new Float32Array(GRID_SIZE * GRID_SIZE);
+          extractEdgeFeatures(captureROI(img), vec);
           goodVectors.push(vec);
           goodThumbnails.push(procCanvas.toDataURL('image/jpeg', 0.8));
           renderStrips();
@@ -405,8 +392,8 @@
     function captureBadSample() {
       if (video.readyState < 2) return;
       const roiData = captureROI(video);
-      const vec = new Float32Array(GRID_SIZE * GRID_SIZE * 3);
-      analyzeFrame(roiData, vec);
+      const vec = new Float32Array(GRID_SIZE * GRID_SIZE);
+      extractEdgeFeatures(roiData, vec);
       badVectors.push(vec);
       badThumbnails.push(procCanvas.toDataURL('image/jpeg', 0.8));
       renderStrips();
@@ -416,8 +403,8 @@
       Array.from(e.target.files).forEach(file => {
         const img = new Image();
         img.onload = () => {
-          const vec = new Float32Array(GRID_SIZE * GRID_SIZE * 3);
-          analyzeFrame(captureROI(img), vec);
+          const vec = new Float32Array(GRID_SIZE * GRID_SIZE);
+          extractEdgeFeatures(captureROI(img), vec);
           badVectors.push(vec);
           badThumbnails.push(procCanvas.toDataURL('image/jpeg', 0.8));
           renderStrips();
@@ -456,7 +443,7 @@
 
       const profile = {
         name: name,
-        beltBaselineDensity: beltBaselineDensity,
+        beltBaselineEdgeEnergy: beltBaselineEdgeEnergy,
         sensitivity: sensitivityInput.value,
         presenceSens: presenceInput.value,
         goodVectors: goodVectors.map(arr => Array.from(arr)),
@@ -465,9 +452,9 @@
         badThumbnails: badThumbnails
       };
 
-      let profiles = JSON.parse(localStorage.getItem('spatial_inspector_profiles') || '{}');
+      let profiles = JSON.parse(localStorage.getItem('smart_inspector_profiles') || '{}');
       profiles[name] = profile;
-      localStorage.setItem('spatial_inspector_profiles', JSON.stringify(profiles));
+      localStorage.setItem('smart_inspector_profiles', JSON.stringify(profiles));
 
       populateProfileDropdown();
       profileSelect.value = name;
@@ -475,7 +462,7 @@
     }
 
     function populateProfileDropdown() {
-      let profiles = JSON.parse(localStorage.getItem('spatial_inspector_profiles') || '{}');
+      let profiles = JSON.parse(localStorage.getItem('smart_inspector_profiles') || '{}');
       profileSelect.innerHTML = '<option value="">-- Load Profile --</option>';
       for (let name in profiles) {
         const opt = document.createElement('option');
@@ -488,11 +475,11 @@
       const name = profileSelect.value;
       if (!name) return;
 
-      let profiles = JSON.parse(localStorage.getItem('spatial_inspector_profiles') || '{}');
+      let profiles = JSON.parse(localStorage.getItem('smart_inspector_profiles') || '{}');
       const p = profiles[name];
       if (!p) return;
 
-      beltBaselineDensity = p.beltBaselineDensity;
+      beltBaselineEdgeEnergy = p.beltBaselineEdgeEnergy;
       sensitivityInput.value = p.sensitivity;
       sensValDisplay.innerText = `${p.sensitivity}%`;
       presenceInput.value = p.presenceSens;
@@ -511,9 +498,9 @@
       const name = profileSelect.value;
       if (!name) return;
       if (confirm(`Delete profile "${name}"?`)) {
-        let profiles = JSON.parse(localStorage.getItem('spatial_inspector_profiles') || '{}');
+        let profiles = JSON.parse(localStorage.getItem('smart_inspector_profiles') || '{}');
         delete profiles[name];
-        localStorage.setItem('spatial_inspector_profiles', JSON.stringify(profiles));
+        localStorage.setItem('smart_inspector_profiles', JSON.stringify(profiles));
         populateProfileDropdown();
       }
     }
@@ -535,47 +522,42 @@
       }
     }
 
-    /* HIGH-SPEED PEAK FRAME EVALUATION LOOP */
     function scanLoop() {
       if (!isScanning) return;
       
       if (video.readyState >= 2) {
         const roiData = captureROI(video);
-        const currentDensity = analyzeFrame(roiData, currentFrameVector);
-        const delta = Math.abs(currentDensity - beltBaselineDensity);
+        const currentEnergy = extractEdgeFeatures(roiData, currentEdgeVector);
+        const delta = Math.abs(currentEnergy - beltBaselineEdgeEnergy);
         
         document.getElementById('debugDeltaVal').innerText = delta.toFixed(2);
-        document.getElementById('debugPeakVal').innerText = currentPassMaxDelta.toFixed(2);
+        document.getElementById('debugPeakVal').innerText = currentPassMaxEnergy.toFixed(2);
 
         const highThreshold = parseFloat(presenceInput.value);
         const lowThreshold = highThreshold * 0.4;
 
-        // 1. OBJECT IS IN INSPECTION ZONE -> TRACK AND RECORD PEAK FRAME
         if (delta >= highThreshold) {
           if (!objectInZone) {
             objectInZone = true;
-            currentPassMaxDelta = 0; // Reset peak accumulator on new item entry
+            currentPassMaxEnergy = 0;
           }
 
           liveStatus.className = "status-badge status-standby";
-          liveStatus.innerText = "TRACKING ITEM PASS...";
+          liveStatus.innerText = "TRACKING PRODUCT PASS...";
           document.getElementById('debugState').innerText = "TRACKING PEAK";
           document.getElementById('debugState').style.color = "#3b82f6";
 
-          // If current frame has higher contrast/spatial visual alignment than prior frames, lock it down as peak
-          if (delta > currentPassMaxDelta) {
-            currentPassMaxDelta = delta;
-            peakFrameVector.set(currentFrameVector);
+          if (currentEnergy > currentPassMaxEnergy) {
+            currentPassMaxEnergy = currentEnergy;
+            peakEdgeVector.set(currentEdgeVector);
             peakSnapshotUrl = procCanvas.toDataURL('image/jpeg', 0.85);
           }
         } 
-        // 2. OBJECT HAS EXITED ZONE -> EVALUATE SINGLE OPTIMAL PEAK SNAPSHOT
         else if (delta < lowThreshold && objectInZone) {
-          objectInZone = false; // Reset lock for next item
+          objectInZone = false;
 
-          // Execute Pass/Fail decision on stored PEAK frame
-          let minGoodDiff = Math.min(...goodVectors.map(v => compareVectors(v, peakFrameVector)));
-          let minBadDiff = badVectors.length > 0 ? Math.min(...badVectors.map(v => compareVectors(v, peakFrameVector))) : 999;
+          let minGoodDiff = Math.min(...goodVectors.map(v => compareEdgeVectors(v, peakEdgeVector)));
+          let minBadDiff = badVectors.length > 0 ? Math.min(...badVectors.map(v => compareEdgeVectors(v, peakEdgeVector))) : 999;
 
           const defectLimit = parseFloat(sensitivityInput.value);
           const isRejectMatch = minBadDiff < minGoodDiff && minBadDiff < defectLimit;
@@ -583,7 +565,7 @@
 
           if (isDeviation || isRejectMatch) {
             liveStatus.className = "status-badge status-fail";
-            liveStatus.innerText = `DEFECT DETECTED (${minGoodDiff.toFixed(1)}% Variance)`;
+            liveStatus.innerText = `DEFECT DETECTED (${minGoodDiff.toFixed(1)}% Edge Variance)`;
             triggerAlarm();
             logDefect(minGoodDiff, peakSnapshotUrl);
           } else {
@@ -591,12 +573,10 @@
             liveStatus.innerText = `PASS (${minGoodDiff.toFixed(1)}% Difference)`;
           }
 
-          // Smooth background auto-exposure drift during belt gap
-          beltBaselineDensity = (beltBaselineDensity * 0.90) + (currentDensity * 0.10);
+          beltBaselineEdgeEnergy = (beltBaselineEdgeEnergy * 0.90) + (currentEnergy * 0.10);
         }
-        // 3. IDLE BELT STATE
         else if (!objectInZone) {
-          beltBaselineDensity = (beltBaselineDensity * 0.98) + (currentDensity * 0.02);
+          beltBaselineEdgeEnergy = (beltBaselineEdgeEnergy * 0.98) + (currentEnergy * 0.02);
           liveStatus.className = "status-badge status-empty";
           liveStatus.innerText = "BELT CLEAR";
           document.getElementById('debugState').innerText = "CLEAR";
@@ -617,7 +597,7 @@
         <img src="${snapshotUrl}"/>
         <div class="log-info">
           <strong>Defect #${defectCount}</strong> - ${new Date().toLocaleTimeString()}<br/>
-          <span style="color:var(--danger)">Max Block Variance: ${score.toFixed(1)}%</span>
+          <span style="color:var(--danger)">Edge Structural Shift: ${score.toFixed(1)}%</span>
         </div>
       `;
       logList.insertBefore(logItem, logList.firstChild);
